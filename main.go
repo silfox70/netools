@@ -1,4 +1,5 @@
 // netools - verifica dello stato delle porte TCP di un host
+//            e scoperta degli host attivi su una rete
 //
 // Copyright (C) 2026 Silvestro Scuderi
 //
@@ -33,9 +34,18 @@ import (
 
 const (
 	nomeProgramma = "netools"
-	versione = "0.3"
+	versione      = "0.5"
 	autore        = "Silvestro Scuderi"
 	licenza       = "GPLv3"
+
+	// Verifica delle porte di un host: ogni porta impegna un solo
+	// descrittore, quindi il valore puo' essere generoso.
+	concorrenzaPorteDefault = 50
+
+	// Scansione di rete: ogni host in prova impegna tanti descrittori
+	// quante sono le porte sonda, e valori alti saturano facilmente
+	// gli apparati di rete domestici. Il default e' piu' prudente.
+	concorrenzaScanDefault = 20
 )
 
 // Stato rappresenta l'esito del test su una singola porta.
@@ -103,8 +113,9 @@ var profili = map[string][]int{
 
 // Parametri regolabili da riga di comando.
 var (
-	optTimeout     = flag.Duration("t", 2*time.Second, "timeout per singola porta")
-	optConcorrenza = flag.Int("c", 50, "numero di connessioni contemporanee")
+	optTimeout     = flag.Duration("t", 2*time.Second, "timeout per singola prova")
+	optConcorrenza = flag.Int("c", 0, "prove contemporanee (0 = valore predefinito)")
+	optTentativi   = flag.Int("r", 2, "tentativi ICMP per host (solo con scan)")
 	optSoloAperte  = flag.Bool("a", false, "mostra soltanto le porte aperte")
 	optVersione    = flag.Bool("v", false, "mostra la versione ed esce")
 )
@@ -125,11 +136,43 @@ func main() {
 		os.Exit(0)
 	}
 
-	if *optConcorrenza < 1 {
-		fmt.Fprintln(os.Stderr, "il valore di -c deve essere almeno 1")
+	if *optConcorrenza < 0 {
+		fmt.Fprintln(os.Stderr, "il valore di -c non puo' essere negativo")
 		os.Exit(2)
 	}
 
+	// Sottocomando "scan": scoperta degli host attivi su una rete.
+	if strings.ToLower(flag.Arg(0)) == "scan" {
+		os.Exit(avviaScan())
+	}
+
+	os.Exit(eseguiPorte())
+}
+
+// avviaScan prepara i parametri del sottocomando scan e lo esegue.
+func avviaScan() int {
+	if flag.NArg() < 2 {
+		fmt.Fprintln(os.Stderr, "manca la rete da scandire")
+		fmt.Fprintf(os.Stderr, "esempio: %s scan 192.168.1.0/24\n\n", nomeProgramma)
+		stampaHelp()
+		return 2
+	}
+
+	concorrenza := *optConcorrenza
+	if concorrenza == 0 {
+		concorrenza = concorrenzaScanDefault
+	}
+
+	tentativi := *optTentativi
+	if tentativi < 1 {
+		tentativi = 1
+	}
+
+	return eseguiScan(flag.Arg(1), *optTimeout, concorrenza, tentativi)
+}
+
+// eseguiPorte gestisce la verifica delle porte di un singolo host.
+func eseguiPorte() int {
 	host := flag.Arg(0)
 
 	// Host senza specifica porte: usa il profilo standard.
@@ -145,7 +188,7 @@ func main() {
 	if err != nil {
 		fmt.Fprintf(os.Stderr, "porte non valide: %v\n\n", err)
 		stampaHelp()
-		os.Exit(2)
+		return 2
 	}
 
 	// Risoluzione una volta sola: un fallimento DNS non deve
@@ -153,11 +196,13 @@ func main() {
 	ip, err := net.ResolveIPAddr("ip4", host)
 	if err != nil {
 		fmt.Fprintf(os.Stderr, "risoluzione di %s fallita: %v\n", host, err)
-		os.Exit(1)
+		return 1
 	}
 
-	// La concorrenza non ha senso superiore al numero di porte.
 	concorrenza := *optConcorrenza
+	if concorrenza == 0 {
+		concorrenza = concorrenzaPorteDefault
+	}
 	if concorrenza > len(porte) {
 		concorrenza = len(porte)
 	}
@@ -172,6 +217,7 @@ func main() {
 	durataTotale := time.Since(inizioTotale)
 
 	stampaRisultati(risultati, durataTotale)
+	return 0
 }
 
 // scansiona esegue il test su tutte le porte in parallelo, rispettando
@@ -437,24 +483,28 @@ func arrotonda(d time.Duration) string {
 }
 
 func stampaHelp() {
-	fmt.Printf("%s %s - verifica stato porte TCP\n", nomeProgramma, versione)
+	fmt.Printf("%s %s - verifica porte TCP e scoperta host di rete\n",
+		nomeProgramma, versione)
 	fmt.Printf("Copyright (C) 2026 %s - licenza %s\n", autore, licenza)
 	fmt.Println("Software libero: sei libero di modificarlo e ridistribuirlo.")
 	fmt.Println("NESSUNA GARANZIA, nei limiti consentiti dalla legge.")
 	fmt.Println()
 	fmt.Println("SINTASSI")
-	fmt.Printf("  %s [opzioni] <host> [porte]\n", nomeProgramma)
+	fmt.Printf("  %s [opzioni] <host> [porte]     verifica le porte di un host\n", nomeProgramma)
+	fmt.Printf("  %s [opzioni] scan <rete>        elenca gli host attivi\n", nomeProgramma)
 	fmt.Println()
 	fmt.Println("  <host>   indirizzo IP o nome risolvibile")
 	fmt.Println("  [porte]  se omesso viene usato il profilo 'standard'")
+	fmt.Println("  <rete>   notazione CIDR, da /22 a /32 (es. 192.168.1.0/24)")
 	fmt.Println()
 	fmt.Println("OPZIONI")
-	fmt.Println("  -t durata   timeout per singola porta          (default 2s)")
-	fmt.Println("  -c numero   connessioni contemporanee          (default 50)")
+	fmt.Println("  -t durata   timeout per singola prova          (default 2s)")
+	fmt.Println("  -c numero   prove contemporanee                (50 porte, 20 scan)")
+	fmt.Println("  -r numero   tentativi ICMP per host            (default 2, solo scan)")
 	fmt.Println("  -a          mostra soltanto le porte aperte")
 	fmt.Println("  -v          mostra la versione")
 	fmt.Println()
-	fmt.Println("  Le opzioni vanno indicate prima dell'host.")
+	fmt.Println("  Le opzioni vanno indicate prima dell'host o del sottocomando.")
 	fmt.Println()
 	fmt.Println("SPECIFICA PORTE")
 	fmt.Println("  profilo       standard | storage | web")
@@ -471,19 +521,35 @@ func stampaHelp() {
 	fmt.Println("ESEMPI")
 	fmt.Printf("  %s 10.0.0.5                    profilo standard\n", nomeProgramma)
 	fmt.Printf("  %s 10.0.0.5 storage            profilo storage\n", nomeProgramma)
-	fmt.Printf("  %s 10.0.0.5 8023               porta singola\n", nomeProgramma)
 	fmt.Printf("  %s 10.0.0.5 8023-8050          intervallo\n", nomeProgramma)
 	fmt.Printf("  %s -a -c 100 10.0.0.5 1-1024   scansione ampia\n", nomeProgramma)
-	fmt.Printf("  %s -t 500ms 10.0.0.5 storage   timeout ridotto in LAN\n", nomeProgramma)
+	fmt.Printf("  %s scan 192.168.1.0/24         host attivi sulla rete\n", nomeProgramma)
+	fmt.Printf("  %s -t 1s -r 3 scan 10.0.0.0/24 rete con collegamenti instabili\n", nomeProgramma)
 	fmt.Println()
-	fmt.Println("STATI")
+	fmt.Println("STATI DELLE PORTE")
 	fmt.Println("  APERTA    handshake completato, un servizio ascolta")
 	fmt.Println("  CHIUSA    RST ricevuto: host raggiungibile, nessun servizio")
 	fmt.Println("  FILTRATA  nessuna risposta: pacchetti scartati da un firewall")
 	fmt.Println()
+	fmt.Println("SCOPERTA HOST")
+	fmt.Println("  Vengono usate entrambe le sonde, ICMP e TCP: i due canali possono")
+	fmt.Println("  essere filtrati in modo indipendente, e un host che ignora il ping")
+	fmt.Println("  puo' comunque rispondere su una porta. Se il socket ICMP non e'")
+	fmt.Println("  disponibile viene usata la sola sonda TCP, e cio' viene indicato")
+	fmt.Println("  nell'intestazione.")
+	fmt.Println()
+	fmt.Println("  ICMP non prevede ritrasmissione: gli indirizzi silenziosi vengono")
+	fmt.Println("  ritentati per non dare per spento un host che ha semplicemente")
+	fmt.Println("  perso un pacchetto. Su reti con molti collegamenti wifi conviene")
+	fmt.Println("  alzare -r a 3.")
+	fmt.Println()
 	fmt.Println("NOTE")
 	fmt.Println("  Solo TCP. I servizi UDP (snmp, ipmi, syslog) non vengono rilevati.")
-	fmt.Println("  In LAN un timeout di 500ms e' ampiamente sufficiente e velocizza molto.")
-	fmt.Println("  Valori alti di -c possono far scattare gli IDS: su reti sorvegliate")
-	fmt.Println("  conviene restare sotto la ventina di connessioni contemporanee.")
+	fmt.Println("  La prima scansione di una rete e' sempre la piu' lenta: la cache ARP")
+	fmt.Println("  e' vuota e ogni indirizzo richiede una risoluzione preliminare.")
+	fmt.Println("  Valori alti di -c saturano gli apparati di rete e producono falsi")
+	fmt.Println("  negativi: se i risultati variano fra esecuzioni successive, il")
+	fmt.Println("  valore e' troppo alto.")
+	fmt.Println("  La scoperta di host su una rete e' a tutti gli effetti un'attivita'")
+	fmt.Println("  di ricognizione: su infrastrutture non proprie va concordata prima.")
 }
