@@ -141,3 +141,60 @@ Le porte vengono verificate in parallelo con un limite di connessioni contempora
 GPLv3 — vedi il file [LICENSE](LICENSE).
 
 Copyright (C) 2026 Silvestro Scuderi
+
+
+
+
+Aggiunta la scoperta degli host attivi su una rete.
+
+## Novità
+
+**Sottocomando `scan`** — dato un indirizzo di rete in notazione CIDR, elenca gli host attivi:
+
+    netools scan 192.168.1.0/24
+
+Vengono usate due sonde indipendenti, ICMP echo e TCP su porte comuni, perché i due canali possono essere filtrati separatamente: un host con il ping bloccato da policy risponde comunque su una porta, e verrebbe dato per spento da una verifica basata sul solo ICMP. L'output segnala esplicitamente quali host rispondono su un canale soltanto.
+
+Se il socket ICMP non è disponibile viene usata la sola sonda TCP, e la cosa è indicata nell'intestazione anziché passare sotto silenzio. Su macOS e su molte distribuzioni Linux ICMP funziona anche senza privilegi, grazie al socket ICMP non privilegiato.
+
+**Ritentativi ICMP** (opzione `-r`, default 2) — ICMP non prevede ritrasmissione, quindi un pacchetto perso significa host dichiarato spento. Gli indirizzi silenziosi vengono ritentati, e gli host che rispondono solo dopo il primo tentativo sono segnalati come tali: è un indizio di collegamento poco affidabile, tipicamente wifi con segnale debole.
+
+**Correzione della classificazione degli errori su Windows** — i codici Winsock non coincidono con gli errno POSIX. Senza la mappatura corretta una porta chiusa veniva riportata come errore generico, e chi leggeva l'output non aveva modo di accorgersene.
+
+**Porte separate da spazi** oltre che da virgole. In precedenza gli argomenti in eccesso venivano ignorati senza alcun avviso.
+
+## Binari
+
+| File | Sistema | Architettura | Note |
+|---|---|---|---|
+| `netools-linux-amd64` | Linux | x86-64 | server e desktop |
+| `netools-linux-386` | Linux | x86 32 bit | sistemi datati |
+| `netools-linux-arm64` | Linux | ARM 64 bit | Raspberry Pi 4/5, VM ARM |
+| `netools-linux-armv7` | Linux | ARM 32 bit | Raspberry Pi 2/3 |
+| `netools-darwin-arm64` | macOS | Apple Silicon | M1 e successivi |
+| `netools-darwin-amd64` | macOS | Intel | |
+| `netools-windows-amd64.exe` | Windows | x86-64 | |
+| `netools-windows-arm64.exe` | Windows | ARM 64 bit | |
+| `netools-freebsd-amd64` | FreeBSD | x86-64 | TrueNAS, pfSense |
+
+Binari statici: non richiedono runtime, librerie di sistema o privilegi di amministratore.
+
+## Uso
+
+Su Linux, macOS e FreeBSD il file va reso eseguibile:
+
+    chmod +x netools-linux-amd64
+    ./netools-linux-amd64 10.0.0.5 storage
+    ./netools-linux-amd64 scan 10.0.0.0/24
+
+Su macOS un binario scaricato viene messo in quarantena da Gatekeeper e va sbloccato:
+
+    xattr -d com.apple.quarantine netools-darwin-arm64
+
+## Note sulla scansione di rete
+
+La prima scansione di una rete è sempre la più lenta: la cache ARP è vuota e ogni indirizzo richiede una risoluzione preliminare. Su una /24 la differenza fra la prima e la seconda esecuzione può essere di un fattore cinque.
+
+Valori alti di `-c` saturano gli apparati di rete e producono falsi negativi. Se i risultati variano fra esecuzioni successive il valore è troppo alto: su una rete domestica `-c 10` è già sufficiente.
+
+La scoperta di host è a tutti gli effetti un'attività di ricognizione: su infrastrutture non proprie va concordata in anticipo.
