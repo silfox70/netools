@@ -1,14 +1,12 @@
 # netools
 
-Strumento a riga di comando per due domande che si pongono spesso insieme: **quali host sono attivi su una rete** e **quali porte espone un host**.
+Strumento a riga di comando per tre domande che si pongono spesso insieme: **quali host sono attivi su una rete**, **quali porte espone un host** e **cosa c'è in ascolto** su quelle porte.
 
 Binario singolo senza dipendenze, compilabile per Linux, macOS, Windows e FreeBSD a partire dallo stesso sorgente.
 
 ## A cosa serve
 
 I comandi tradizionali dicono se qualcosa risponde. `netools` dice **come** risponde, e da lì si ricava molto di più.
-
-Sulle porte di un host:
 
 | Stato | Cosa è successo | Interpretazione |
 |---|---|---|
@@ -17,8 +15,6 @@ Sulle porte di un host:
 | `FILTRATA` | nessuna risposta entro il timeout | i pacchetti vengono scartati in silenzio |
 
 La differenza fra `CHIUSA` e `FILTRATA` è l'informazione più utile: un host che risponde con RST è raggiungibile e sta dichiarando che lì non ascolta nessuno, mentre il silenzio indica un firewall in *drop*.
-
-Sulla scoperta degli host, la logica è la stessa applicata a due canali distinti: ICMP e TCP possono essere filtrati in modo indipendente, e sapere su quale dei due un host risponde dice qualcosa sulla sua configurazione.
 
 ## Leggere i risultati
 
@@ -42,14 +38,37 @@ Al contrario, un host che restituisce solo `APERTA` e `FILTRATA` senza nessun RS
 
 Come regola pratica: tempo di rete = risposta esplicita, timeout pieno = silenzio.
 
+### Identificazione dei servizi
+
+Con `-b` ogni porta aperta viene interrogata per ricavarne l'identità.
+
+```
+   22/tcp  APERTA   172ms  ssh    SSH-2.0-OpenSSH_6.6.1p1 Ubuntu-2ubuntu2.13
+   80/tcp  APERTA   178ms  http   Apache/2.4.7 (Ubuntu)
+```
+
+Non è un dettaglio estetico: quelle due righe dicono che dall'altra parte c'è una Ubuntu 14.04, fuori supporto da anni. Il solo numero di porta non lo avrebbe mai detto.
+
+Sulle porte cifrate viene mostrato anche il nome comune del certificato, che sugli apparati di gestione identifica il dispositivo meglio di qualsiasi banner applicativo:
+
+```
+  443/tcp  APERTA     2ms  https  TLS1.2 | router.lan
+```
+
+E sui dispositivi embedded il banner rivela firmware e microcontrollore:
+
+```
+   80/tcp  APERTA     6ms  http   Tasmota/15.0.1 (ESP8266EX)
+```
+
 ### Host su una rete
 
 ```
-192.168.1.1      attivo   icmp 1ms, tcp/80 4ms
-192.168.1.60     attivo   icmp 620µs, tcp/3389 2ms
-192.168.1.101    attivo   icmp 40ms   [nessuna porta sonda raggiungibile]
-192.168.1.130    attivo   icmp 22ms   [risposta al 2° tentativo]
-192.168.1.155    attivo   tcp/80 131ms   [ICMP senza risposta]
+192.168.1.1                                attivo   icmp 1ms, tcp/443 2ms
+192.168.1.101  switchbot-hub-2.lan         attivo   icmp 110ms   [nessuna porta sonda raggiungibile]
+192.168.1.130  sensore-mq9.lan             attivo   icmp 22ms   [risposta al 2° tentativo]
+192.168.1.155  bme680.lan                  attivo   icmp 3ms, tcp/80 8ms
+192.168.1.158                              attivo   tcp/80 131ms   [ICMP senza risposta]
 ```
 
 Tre situazioni diverse, tutte utili:
@@ -60,7 +79,7 @@ Tre situazioni diverse, tutte utili:
 
 **Solo TCP** — l'host ha il ping bloccato da policy, comportamento comune sui sistemi in dominio Windows. Una verifica basata sul solo `ping` lo darebbe per spento.
 
-L'annotazione `risposta al 2° tentativo` segnala un pacchetto perso al primo giro: indica un collegamento poco affidabile, tipicamente wifi con segnale debole, e su una rete che non si conosce è un'informazione operativa più che un dettaglio.
+L'annotazione `risposta al 2° tentativo` segnala un pacchetto perso al primo giro: indica un collegamento poco affidabile, tipicamente wifi con segnale debole.
 
 ## Uso
 
@@ -92,7 +111,7 @@ Le porte duplicate vengono unificate e l'output è sempre ordinato.
 ```
 netools scan 192.168.1.0/24         una rete /24
 netools scan 10.0.0.0/22            il massimo consentito, 1022 indirizzi
-netools -t 1s -r 3 scan 10.0.0.0/24 rete con collegamenti instabili
+netools -r 3 scan 10.0.0.0/24       rete con collegamenti instabili
 ```
 
 Sono accettate reti da /22 a /32. Il limite serve a evitare che una svista sulla maschera trasformi una verifica in una scansione da decine di migliaia di indirizzi.
@@ -104,15 +123,17 @@ Sono accettate reti da /22 a /32. Il limite serve a evitare che una svista sulla
 | `-t` | `2s` | timeout per singola prova |
 | `-c` | 50 porte, 20 scan | prove contemporanee |
 | `-r` | `2` | tentativi ICMP per host (solo con `scan`) |
+| `-b`, `--banner` | | identifica i servizi in ascolto |
 | `-a` | | mostra soltanto le porte aperte |
 | `-v` | | mostra la versione |
 
 Le opzioni vanno indicate **prima** dell'host o del sottocomando.
 
 ```
-netools -t 500ms 10.0.0.5 storage      timeout ridotto, adatto alla LAN
-netools -a -c 100 10.0.0.5 1-1024      scansione ampia, solo le aperte
-netools -t 1s -c 10 scan 10.0.0.0/24   scansione prudente
+netools -b 10.0.0.5 storage            con identificazione dei servizi
+netools -a -b 10.0.0.5 1-1024          solo le aperte, identificate
+netools -t 500ms 10.0.0.5 storage      timeout ridotto in LAN veloce
+netools -r 3 scan 10.0.0.0/24          rete con molti dispositivi wifi
 ```
 
 ### Profili
@@ -167,23 +188,39 @@ Il test usa una `connect()` TCP completa, non un SYN scan: non servono privilegi
 
 I codici di errore restituiti dallo stack di rete non coincidono fra sistemi POSIX e Windows — un RST arriva come `ECONNREFUSED` sui primi e come `WSAECONNREFUSED` sul secondo. La mappatura è isolata in `errori_unix.go` ed `errori_windows.go`, selezionati automaticamente dal compilatore tramite build constraint.
 
-Le porte vengono verificate in parallelo con un limite di connessioni contemporanee: il tempo totale è quello della porta più lenta, non la somma di tutte. Un profilo da 25 porte con tre filtrate passa da circa 10 secondi a poco più del timeout impostato.
+Le porte vengono verificate in parallelo con un limite di connessioni contemporanee: il tempo totale è quello della porta più lenta, non la somma di tutte.
+
+### Identificazione dei servizi
+
+I protocolli si comportano in tre modi diversi, e l'identificazione li affronta in sequenza.
+
+Alcuni **si presentano da soli** appena la connessione si apre: SSH, SMTP, FTP, POP3, IMAP inviano una riga di saluto, e basta leggerla.
+
+Altri **restano in attesa di una richiesta**. A questi viene inviata una `HEAD` minima, da cui si estrae l'intestazione `Server`.
+
+Altri ancora **non dicono nulla in chiaro**. Sulle porte cifrate per convenzione si completa l'handshake TLS, ricavando versione del protocollo e nome comune del certificato; dove sotto TLS c'è HTTP, si prosegue con la richiesta.
+
+L'opzione comporta l'invio di dati verso il servizio, e quindi una traccia più evidente nei log del sistema interrogato: per questo non è attiva di default.
 
 ### Scoperta degli host
 
-Vengono usate entrambe le sonde. Per ICMP il programma tenta prima il raw socket e, se non è disponibile, ripiega sul socket ICMP non privilegiato: su macOS e su molte distribuzioni Linux questo consente il ping anche senza privilegi. Se nessuno dei due si apre, la scansione prosegue con la sola sonda TCP e la limitazione viene dichiarata nell'intestazione.
+Vengono usate entrambe le sonde, ICMP e TCP. Per ICMP il programma tenta prima il raw socket e, se non è disponibile, ripiega sul socket ICMP non privilegiato: su macOS e su molte distribuzioni Linux questo consente il ping anche senza privilegi. Se nessuno dei due si apre, la scansione prosegue con la sola sonda TCP e la limitazione viene dichiarata nell'intestazione.
 
 La sonda TCP considera prova di vita sia una connessione accettata sia un RST: in entrambi i casi qualcuno ha risposto.
 
 ICMP non prevede ritrasmissione, quindi un pacchetto perso equivarrebbe a un host dichiarato spento. Gli indirizzi silenziosi vengono ritentati, e siccome ogni giro interroga solo chi non ha ancora risposto, il costo dei tentativi successivi è proporzionale ai silenziosi e non al totale della rete.
 
+Degli host attivi viene tentata la risoluzione inversa del nome, in parallelo e con un timeout indipendente da quello delle sonde: un indirizzo privo di record PTR fa attendere il resolver fino alla propria scadenza, e legare i due tempi penalizzerebbe chi imposta un timeout generoso per una rete lenta.
+
 ## Taratura
 
-Su una rete locale il timeout predefinito di 2 secondi è largamente sovradimensionato: `-t 500ms` sulle porte e `-t 1s` sulla scansione danno gli stessi risultati in una frazione del tempo.
+**Il timeout va scelto in base a chi risponde, non alla distanza.** Su una LAN cablata `-t 500ms` è abbondante. Ma i dispositivi embedded e i collegamenti wifi possono impiegare oltre un secondo a completare un handshake, e con un timeout stretto scompaiono dall'elenco: se una scansione trova meno host di quanti ne trovava con parametri più larghi, il timeout è la prima cosa da guardare.
 
 La **prima scansione di una rete è sempre la più lenta**, perché la cache ARP è vuota e ogni indirizzo richiede una risoluzione preliminare. Su una /24 la differenza fra prima e seconda esecuzione può essere di un fattore cinque. Per un inventario affidabile conviene lanciarla due volte e usare il secondo risultato.
 
-Valori alti di `-c` **saturano gli apparati di rete e producono falsi negativi**. Se i risultati variano fra esecuzioni successive, il valore è troppo alto: su una rete domestica `-c 10` è già sufficiente. Ogni host in prova impegna tanti descrittori quante sono le porte sonda, quindi vale la pena controllare `ulimit -n` prima di alzare il valore.
+Valori alti di `-c` **saturano gli apparati di rete e producono falsi negativi**. Se i risultati variano fra esecuzioni successive, il valore è troppo alto: su una rete domestica `-c 10` è già sufficiente. Ogni host in prova impegna tanti descrittori quante sono le porte sonda, quindi vale la pena controllare `ulimit -n` prima di alzarlo.
+
+Su reti con molti dispositivi wireless, `-r 3` riduce ulteriormente i falsi negativi.
 
 ## Limitazioni
 
@@ -193,7 +230,9 @@ Valori alti di `-c` **saturano gli apparati di rete e producono falsi negativi**
 
 **Lo stato `CHIUSA` non identifica chi ha risposto.** Un RST può provenire dall'host oppure da un firewall configurato in *reject* anziché in *drop*. Ciò che il test stabilisce con certezza è la differenza fra rifiuto esplicito e silenzio.
 
-**La connessione viene completata**, quindi lascia traccia nei log del sistema di destinazione.
+**Il banner è ciò che il servizio dichiara**, non ciò che è: può essere modificato o soppresso, e l'assenza di un'intestazione `Server` è una scelta di configurazione diffusa.
+
+**La connessione viene completata**, quindi lascia traccia nei log del sistema di destinazione. Con `-b` la traccia è più evidente, perché vengono inviati dati.
 
 **La scansione di rete è un'attività di ricognizione.** Su infrastrutture non proprie va concordata in anticipo: valori aggressivi di `-c` fanno scattare gli IDS, e in ambienti sorvegliati la conseguenza è un blocco automatico.
 
