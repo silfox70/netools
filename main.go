@@ -34,7 +34,7 @@ import (
 
 const (
 	nomeProgramma = "netools"
-	versione      = "0.5"
+	versione      = "0.6"
 	autore        = "Silvestro Scuderi"
 	licenza       = "GPLv3"
 
@@ -77,6 +77,7 @@ type Risultato struct {
 	Stato    Stato
 	Durata   time.Duration
 	Dettagli string
+	Banner   string // identificazione del servizio, se richiesta
 }
 
 // profili raccoglie gli elenchi di porte richiamabili per nome.
@@ -118,7 +119,17 @@ var (
 	optTentativi   = flag.Int("r", 2, "tentativi ICMP per host (solo con scan)")
 	optSoloAperte  = flag.Bool("a", false, "mostra soltanto le porte aperte")
 	optVersione    = flag.Bool("v", false, "mostra la versione ed esce")
+
+	// Il package flag non collega da solo forma breve ed estesa:
+	// sono due variabili distinte, e vale l'una o l'altra.
+	optBannerB    = flag.Bool("b", false, "identifica i servizi sulle porte aperte")
+	optBannerLong = flag.Bool("banner", false, "identifica i servizi sulle porte aperte")
 )
+
+// bannerRichiesto unifica le due forme dell'opzione.
+func bannerRichiesto() bool {
+	return *optBannerB || *optBannerLong
+}
 
 func main() {
 	flag.Usage = stampaHelp
@@ -209,8 +220,12 @@ func eseguiPorte() int {
 
 	fmt.Printf("%s %s - scansione di %s (%s)\n",
 		nomeProgramma, versione, host, ip.IP)
-	fmt.Printf("%d porte, timeout %v, %d connessioni contemporanee\n\n",
+	fmt.Printf("%d porte, timeout %v, %d connessioni contemporanee",
 		len(porte), *optTimeout, concorrenza)
+	if bannerRichiesto() {
+		fmt.Print(", identificazione servizi attiva")
+	}
+	fmt.Print("\n\n")
 
 	inizioTotale := time.Now()
 	risultati := scansiona(ip.IP.String(), porte, *optTimeout, concorrenza)
@@ -269,7 +284,16 @@ func scansiona(ip string, porte []int, timeout time.Duration, concorrenza int) [
 			semaforo <- struct{}{}        // acquisisce il permesso
 			defer func() { <-semaforo }() // lo rilascia all'uscita
 
-			risultati[indice] = testPorta(ip, porta, timeout)
+			r := testPorta(ip, porta, timeout)
+
+			// L'identificazione richiede una seconda connessione e
+			// l'invio di dati: si esegue soltanto dove c'e' davvero
+			// un servizio con cui parlare.
+			if r.Stato == Aperta && bannerRichiesto() {
+				r.Banner = leggiBanner(ip, porta, timeout)
+			}
+
+			risultati[indice] = r
 			atomic.AddInt64(&completate, 1)
 		}(i, p)
 	}
@@ -289,7 +313,7 @@ func scansiona(ip string, porte []int, timeout time.Duration, concorrenza int) [
 // stampaRisultati produce l'elenco e il riepilogo finale.
 func stampaRisultati(risultati []Risultato, durataTotale time.Duration) {
 	var aperte, chiuse, filtrate, errori int
-	var mostrate int
+	var mostrate, identificati int
 
 	for _, r := range risultati {
 		switch r.Stato {
@@ -303,15 +327,25 @@ func stampaRisultati(risultati []Risultato, durataTotale time.Duration) {
 			errori++
 		}
 
+		if r.Banner != "" {
+			identificati++
+		}
+
 		if *optSoloAperte && r.Stato != Aperta {
 			continue
 		}
 
 		riga := fmt.Sprintf("%5d/tcp  %-9s %8s  %-12s",
 			r.Porta, r.Stato, arrotonda(r.Durata), nomeServizio(r.Porta))
-		if r.Dettagli != "" {
+
+		// Il banner sostituisce i dettagli quando c'e': dice molto
+		// di piu' sul servizio di quanto non faccia una nota tecnica.
+		if r.Banner != "" {
+			riga += " " + r.Banner
+		} else if r.Dettagli != "" {
 			riga += " [" + r.Dettagli + "]"
 		}
+
 		fmt.Println(strings.TrimRight(riga, " "))
 		mostrate++
 	}
@@ -324,6 +358,9 @@ func stampaRisultati(risultati []Risultato, durataTotale time.Duration) {
 	if errori > 0 {
 		fmt.Printf(", %d errori", errori)
 	}
+	if bannerRichiesto() && aperte > 0 {
+		fmt.Printf(", %d servizi identificati", identificati)
+	}
 	fmt.Printf("  (in %s)\n", durataTotale.Round(time.Millisecond))
 
 	// Il confronto fra risposte esplicite e silenzio e' l'indizio
@@ -331,6 +368,11 @@ func stampaRisultati(risultati []Risultato, durataTotale time.Duration) {
 	if filtrate > 0 && chiuse > 0 {
 		fmt.Println("\nnota: la presenza di porte che rispondono con RST accanto ad altre")
 		fmt.Println("che restano in silenzio indica un filtro selettivo lungo il percorso.")
+	}
+
+	if aperte > 0 && !bannerRichiesto() {
+		fmt.Println("\nsuggerimento: con -b viene interrogato ogni servizio in ascolto")
+		fmt.Println("per ricavarne versione e identita'.")
 	}
 }
 
@@ -498,11 +540,12 @@ func stampaHelp() {
 	fmt.Println("  <rete>   notazione CIDR, da /22 a /32 (es. 192.168.1.0/24)")
 	fmt.Println()
 	fmt.Println("OPZIONI")
-	fmt.Println("  -t durata   timeout per singola prova          (default 2s)")
-	fmt.Println("  -c numero   prove contemporanee                (50 porte, 20 scan)")
-	fmt.Println("  -r numero   tentativi ICMP per host            (default 2, solo scan)")
-	fmt.Println("  -a          mostra soltanto le porte aperte")
-	fmt.Println("  -v          mostra la versione")
+	fmt.Println("  -t durata     timeout per singola prova        (default 2s)")
+	fmt.Println("  -c numero     prove contemporanee              (50 porte, 20 scan)")
+	fmt.Println("  -r numero     tentativi ICMP per host          (default 2, solo scan)")
+	fmt.Println("  -b, -banner   identifica i servizi in ascolto")
+	fmt.Println("  -a            mostra soltanto le porte aperte")
+	fmt.Println("  -v            mostra la versione")
 	fmt.Println()
 	fmt.Println("  Le opzioni vanno indicate prima dell'host o del sottocomando.")
 	fmt.Println()
@@ -520,9 +563,9 @@ func stampaHelp() {
 	fmt.Println()
 	fmt.Println("ESEMPI")
 	fmt.Printf("  %s 10.0.0.5                    profilo standard\n", nomeProgramma)
-	fmt.Printf("  %s 10.0.0.5 storage            profilo storage\n", nomeProgramma)
+	fmt.Printf("  %s -b 10.0.0.5 storage         con identificazione dei servizi\n", nomeProgramma)
 	fmt.Printf("  %s 10.0.0.5 8023-8050          intervallo\n", nomeProgramma)
-	fmt.Printf("  %s -a -c 100 10.0.0.5 1-1024   scansione ampia\n", nomeProgramma)
+	fmt.Printf("  %s -a -b 10.0.0.5 1-1024       solo aperte, con identificazione\n", nomeProgramma)
 	fmt.Printf("  %s scan 192.168.1.0/24         host attivi sulla rete\n", nomeProgramma)
 	fmt.Printf("  %s -t 1s -r 3 scan 10.0.0.0/24 rete con collegamenti instabili\n", nomeProgramma)
 	fmt.Println()
@@ -531,12 +574,22 @@ func stampaHelp() {
 	fmt.Println("  CHIUSA    RST ricevuto: host raggiungibile, nessun servizio")
 	fmt.Println("  FILTRATA  nessuna risposta: pacchetti scartati da un firewall")
 	fmt.Println()
+	fmt.Println("IDENTIFICAZIONE DEI SERVIZI")
+	fmt.Println("  Con -b ogni porta aperta viene interrogata per ricavarne l'identita'.")
+	fmt.Println("  Alcuni protocolli si presentano da soli, altri rispondono a una")
+	fmt.Println("  richiesta, altri ancora parlano solo sotto TLS: i tre casi sono")
+	fmt.Println("  gestiti in sequenza. Sulle porte cifrate viene mostrato anche il")
+	fmt.Println("  nome comune del certificato, che spesso identifica l'apparato")
+	fmt.Println("  meglio di qualsiasi banner applicativo.")
+	fmt.Println()
+	fmt.Println("  L'opzione comporta l'invio di dati verso il servizio, e quindi una")
+	fmt.Println("  traccia piu' evidente nei log del sistema interrogato.")
+	fmt.Println()
 	fmt.Println("SCOPERTA HOST")
 	fmt.Println("  Vengono usate entrambe le sonde, ICMP e TCP: i due canali possono")
 	fmt.Println("  essere filtrati in modo indipendente, e un host che ignora il ping")
-	fmt.Println("  puo' comunque rispondere su una porta. Se il socket ICMP non e'")
-	fmt.Println("  disponibile viene usata la sola sonda TCP, e cio' viene indicato")
-	fmt.Println("  nell'intestazione.")
+	fmt.Println("  puo' comunque rispondere su una porta. Degli host attivi viene")
+	fmt.Println("  tentata la risoluzione inversa del nome.")
 	fmt.Println()
 	fmt.Println("  ICMP non prevede ritrasmissione: gli indirizzi silenziosi vengono")
 	fmt.Println("  ritentati per non dare per spento un host che ha semplicemente")
@@ -544,7 +597,7 @@ func stampaHelp() {
 	fmt.Println("  alzare -r a 3.")
 	fmt.Println()
 	fmt.Println("NOTE")
-	fmt.Println("  Solo TCP. I servizi UDP (snmp, ipmi, syslog) non vengono rilevati.")
+	fmt.Println("  Solo TCP e IPv4. I servizi UDP non vengono rilevati.")
 	fmt.Println("  La prima scansione di una rete e' sempre la piu' lenta: la cache ARP")
 	fmt.Println("  e' vuota e ogni indirizzo richiede una risoluzione preliminare.")
 	fmt.Println("  Valori alti di -c saturano gli apparati di rete e producono falsi")

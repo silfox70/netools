@@ -8,6 +8,7 @@
 package main
 
 import (
+	"context"
 	"encoding/binary"
 	"fmt"
 	"net"
@@ -26,6 +27,13 @@ import (
 // qualsiasi tipo, dai server agli apparati di rete.
 var porteSonda = []int{22, 80, 443, 445, 3389}
 
+// timeoutDNS limita l'attesa della risoluzione inversa. E' volutamente
+// indipendente dal timeout delle sonde: un indirizzo privo di record
+// PTR fa attendere il resolver fino alla propria scadenza, e su una
+// rete dove mancano molti nomi l'attesa complessiva supererebbe quella
+// della scansione vera e propria.
+const timeoutDNS = 500 * time.Millisecond
+
 // modoICMP indica come e' stato possibile aprire il socket ICMP.
 type modoICMP int
 
@@ -38,6 +46,7 @@ const (
 // EsitoHost raccoglie quanto rilevato su un singolo indirizzo.
 type EsitoHost struct {
 	IP        net.IP
+	Nome      string // nome da risoluzione inversa, vuoto se assente
 	RispICMP  bool
 	RttICMP   time.Duration
 	Tentativo int // tentativo in cui e' arrivata la risposta ICMP (1 = primo)
@@ -130,9 +139,49 @@ func eseguiScan(cidr string, timeout time.Duration, concorrenza, tentativi int) 
 	// ritrasmissione del SYN e' gia' compito del kernel.
 	sweepTCP(esiti, timeout, concorrenza)
 
+	// Risoluzione inversa: soltanto sugli host risultati attivi, e in
+	// parallelo, perche' l'attesa di un nome che non esiste non deve
+	// sommarsi a quella degli altri.
+	risolviNomi(esiti)
+
 	durata := time.Since(inizio)
 	stampaScan(esiti, modo, tentativi, durata)
 	return 0
+}
+
+// risolviNomi popola il campo Nome degli host attivi tramite
+// risoluzione inversa. Gli indirizzi privi di record PTR restano senza
+// nome: e' la norma sulle reti dove il DNS inverso non e' popolato, e
+// non costituisce un errore da segnalare.
+func risolviNomi(esiti []EsitoHost) {
+	var wg sync.WaitGroup
+	resolver := &net.Resolver{}
+
+	for i := range esiti {
+		if !esiti[i].Vivo() {
+			continue
+		}
+
+		wg.Add(1)
+		go func(indice int) {
+			defer wg.Done()
+
+			ctx, annulla := context.WithTimeout(context.Background(), timeoutDNS)
+			defer annulla()
+
+			nomi, err := resolver.LookupAddr(ctx, esiti[indice].IP.String())
+			if err != nil || len(nomi) == 0 {
+				return
+			}
+
+			// Un indirizzo puo' avere piu' record PTR: si usa il primo.
+			// Il punto finale e' la forma canonica del DNS, superflua
+			// nella visualizzazione.
+			esiti[indice].Nome = strings.TrimSuffix(nomi[0], ".")
+		}(i)
+	}
+
+	wg.Wait()
 }
 
 // apriICMP tenta l'apertura nel modo migliore disponibile.
@@ -412,13 +461,29 @@ func espandiRete(cidr string) ([]net.IP, error) {
 
 // stampaScan produce l'elenco degli host attivi e il riepilogo.
 func stampaScan(esiti []EsitoHost, modo modoICMP, tentativi int, durata time.Duration) {
-	var vivi, soloTCP, soloICMP, instabili int
+	var vivi, soloTCP, soloICMP, instabili, conNome int
+
+	// La colonna dei nomi si dimensiona sul piu' lungo effettivamente
+	// presente, cosi' su una rete priva di record PTR non resta uno
+	// spazio vuoto a separare le altre colonne.
+	larghezzaNome := 0
+	for _, e := range esiti {
+		if e.Vivo() && len(e.Nome) > larghezzaNome {
+			larghezzaNome = len(e.Nome)
+		}
+	}
+	if larghezzaNome > 28 {
+		larghezzaNome = 28
+	}
 
 	for _, e := range esiti {
 		if !e.Vivo() {
 			continue
 		}
 		vivi++
+		if e.Nome != "" {
+			conNome++
+		}
 
 		var canali []string
 		if e.RispICMP {
@@ -429,7 +494,11 @@ func stampaScan(esiti []EsitoHost, modo modoICMP, tentativi int, durata time.Dur
 				e.PortaTCP, arrotonda(e.RttTCP)))
 		}
 
-		riga := fmt.Sprintf("%-16s attivo   %s", e.IP, strings.Join(canali, ", "))
+		riga := fmt.Sprintf("%-16s", e.IP)
+		if larghezzaNome > 0 {
+			riga += fmt.Sprintf(" %-*s", larghezzaNome, tronca(e.Nome, larghezzaNome))
+		}
+		riga += fmt.Sprintf("  attivo   %s", strings.Join(canali, ", "))
 
 		var note []string
 
@@ -464,22 +533,49 @@ func stampaScan(esiti []EsitoHost, modo modoICMP, tentativi int, durata time.Dur
 		fmt.Println("nessun host attivo rilevato")
 	}
 
-	fmt.Printf("\n%d host attivi su %d indirizzi  (in %s)\n",
-		vivi, len(esiti), durata.Round(time.Millisecond))
+	fmt.Printf("\n%d host attivi su %d indirizzi", vivi, len(esiti))
+	if vivi > 0 {
+		fmt.Printf(", %d con nome risolto", conNome)
+	}
+	fmt.Printf("  (in %s)\n", durata.Round(time.Millisecond))
 
 	if modo != icmpAssente && soloTCP > 0 {
-		fmt.Printf("\nnota: %d host rispondono su TCP ma non a ICMP. E' il\n", soloTCP)
+		if soloTCP == 1 {
+			fmt.Println("\nnota: 1 host risponde su TCP ma non a ICMP. E' il")
+		} else {
+			fmt.Printf("\nnota: %d host rispondono su TCP ma non a ICMP. E' il\n", soloTCP)
+		}
 		fmt.Println("comportamento tipico dei sistemi con il ping bloccato da policy:")
 		fmt.Println("una verifica basata sul solo ICMP li darebbe per spenti.")
 	}
 	if soloICMP > 0 {
-		fmt.Printf("\nnota: %d host rispondono al ping ma nessuna delle porte sonda\n", soloICMP)
+		if soloICMP == 1 {
+			fmt.Println("\nnota: 1 host risponde al ping ma nessuna delle porte sonda")
+		} else {
+			fmt.Printf("\nnota: %d host rispondono al ping ma nessuna delle porte sonda\n", soloICMP)
+		}
 		fmt.Println("e' raggiungibile. Per sapere cosa espongono conviene interrogarli")
 		fmt.Println("singolarmente con un profilo di porte.")
 	}
 	if instabili > 0 {
-		fmt.Printf("\nnota: %d host hanno risposto solo dopo il primo tentativo.\n", instabili)
+		if instabili == 1 {
+			fmt.Println("\nnota: 1 host ha risposto solo dopo il primo tentativo.")
+		} else {
+			fmt.Printf("\nnota: %d host hanno risposto solo dopo il primo tentativo.\n", instabili)
+		}
 		fmt.Println("La perdita di pacchetti indica un collegamento poco affidabile:")
 		fmt.Println("tipicamente wifi con segnale debole o apparati sotto carico.")
 	}
+}
+
+// tronca accorcia i nomi troppo lunghi per la colonna, segnalando il
+// taglio con dei puntini.
+func tronca(s string, max int) string {
+	if len(s) <= max {
+		return s
+	}
+	if max <= 3 {
+		return s[:max]
+	}
+	return s[:max-3] + "..."
 }
